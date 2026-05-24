@@ -1,3 +1,9 @@
-// Homebridge plugin entry point — stub for now
-// Real implementation will register the platform after we nail down the protocol
-export default () => {}
+// Homebridge plugin entry point.
+
+import type { API } from 'homebridge';
+import { PLATFORM_NAME } from './settings.js';
+import { StickDe3Platform } from './platform.js';
+
+export default (api: API): void => {
+  api.registerPlatform(PLATFORM_NAME, StickDe3Platform);
+};

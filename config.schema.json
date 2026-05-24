@@ -1,0 +1,112 @@
+{
+  "pluginAlias": "StickDe3",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "WAC DMX via Nicolaudie Stick-DE3 — see the README for the YAML override path if the schema below is too constrained for your fixtures.",
+  "footerDisplay": "Tip: complex patches (many fixtures, custom profiles) are easiest to maintain in a YAML file pointed to by **yamlPath**. The YAML file replaces the JSON fields entirely.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "default": "Stick-DE3 DMX",
+        "required": false
+      },
+      "ip": {
+        "title": "Stick-DE3 IP Address",
+        "type": "string",
+        "format": "ipv4",
+        "description": "Static IP of the Stick on its DMX VLAN (e.g. 192.168.96.2). Discovery is not supported.",
+        "required": true
+      },
+      "yamlPath": {
+        "title": "YAML config path (optional)",
+        "type": "string",
+        "description": "Absolute or relative path to a YAML file containing the full config. When set, the YAML replaces the JSON fields below.",
+        "required": false
+      },
+      "profiles": {
+        "title": "Fixture Profiles",
+        "type": "array",
+        "required": false,
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "title": "Profile name",
+              "type": "string",
+              "required": true,
+              "description": "Used as the 'type' in patch entries below."
+            },
+            "colormodel": {
+              "title": "Color model",
+              "type": "string",
+              "required": true,
+              "oneOf": [
+                { "title": "Dimmer (1ch)", "enum": ["dimmer"] },
+                { "title": "CCT (2ch intensity + colortemp)", "enum": ["cct"] },
+                { "title": "RGB (3ch)", "enum": ["rgb"] },
+                { "title": "RGBW (4ch + white)", "enum": ["rgbw"] },
+                { "title": "RGBWW (5ch + warm/cool white)", "enum": ["rgbww"] },
+                { "title": "RGBAW (5ch + amber + white)", "enum": ["rgbaw"] },
+                { "title": "HSV+CCT (5ch — WAC DC-WD05 native)", "enum": ["hsvcct"] }
+              ]
+            },
+            "channel_order": {
+              "title": "Channel order",
+              "type": "array",
+              "required": true,
+              "description": "Names in DMX-slot order. Append ' (Fine)' for a 16-bit companion, e.g. 'Intensity (Fine)'. CCT channels include a K range: 'ColorTemp 1650-8000'.",
+              "items": { "type": "string" }
+            }
+          }
+        }
+      },
+      "patch": {
+        "title": "Patch",
+        "type": "array",
+        "required": false,
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "title": "ID",
+              "type": "string",
+              "required": true,
+              "description": "kebab-case identifier; used as the fixture's stable handle."
+            },
+            "name": {
+              "title": "HomeKit name",
+              "type": "string",
+              "required": true,
+              "description": "Displayed in the Home app."
+            },
+            "type": {
+              "title": "Profile",
+              "type": "string",
+              "required": true,
+              "description": "Must match a Profile name above."
+            },
+            "universe": {
+              "title": "DMX universe",
+              "type": "string",
+              "default": "A",
+              "oneOf": [
+                { "title": "A", "enum": ["A"] },
+                { "title": "B (currently untested — see README)", "enum": ["B"] }
+              ]
+            },
+            "start": {
+              "title": "DMX start channel",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 512,
+              "required": true
+            }
+          }
+        }
+      }
+    }
+  }
+}
