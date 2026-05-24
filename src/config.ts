@@ -37,7 +37,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import yaml from 'js-yaml';
 
-import { ChannelDef, ColorModel } from './color/types.js';
+import { ChannelDef, ColorModel, HKCharacteristic } from './color/types.js';
 import { getColorModel } from './color/index.js';
 import { parseChannelName } from './color/parsers.js';
 
@@ -62,12 +62,19 @@ export interface PatchSpec {
   start: number;         // 1-based DMX start address
 }
 
+export interface ZoneSpec {
+  id: string;            // unique handle (kebab-case)
+  name: string;          // human-friendly HomeKit name
+  members: string[];     // fixture ids included in this zone
+}
+
 export interface RawConfig {
   name?: string;
   yamlPath?: string;
   controllers?: ControllerSpec[];
   profiles?: ProfileSpec[];
   patch?: PatchSpec[];
+  zones?: ZoneSpec[];
 }
 
 export interface Profile {
@@ -95,10 +102,21 @@ export interface Fixture {
   nChannels: number;     // = channels.length
 }
 
+/** A virtual "zone" Lightbulb: appears as a single accessory in HomeKit;
+ *  setting its state dispatches to every member fixture. The intersection
+ *  of the members' color-model characteristics is what HomeKit sees. */
+export interface Zone {
+  id: string;
+  name: string;
+  members: Fixture[];
+  characteristics: HKCharacteristic[];   // intersection of member characteristics
+}
+
 export interface LoadedConfig {
   name: string;
   controllers: Controller[];
   fixtures: Fixture[];
+  zones: Zone[];
 }
 
 export const DEFAULT_PLATFORM_NAME = 'DMX';
@@ -240,9 +258,51 @@ export function loadConfig(rawJson: RawConfig, cwd?: string): LoadedConfig {
     });
   }
 
+  // Zones — virtual Lightbulb accessories. Each zone's members must be
+  // existing fixture ids. Zones never reference other zones (no recursion).
+  const fixturesById = new Map(fixtures.map((f) => [f.id, f]));
+  const zoneSpecs = raw.zones ?? [];
+  const zones: Zone[] = [];
+  const seenZoneIds = new Set<string>();
+  for (const zs of zoneSpecs) {
+    if (!zs.id) throw new Error('zone: missing id');
+    if (seenZoneIds.has(zs.id)) {
+      throw new Error(`zone: duplicate id "${zs.id}"`);
+    }
+    if (fixturesById.has(zs.id)) {
+      throw new Error(`zone id "${zs.id}" collides with fixture id`);
+    }
+    seenZoneIds.add(zs.id);
+    if (!Array.isArray(zs.members) || zs.members.length === 0) {
+      throw new Error(`zone "${zs.id}": members must be a non-empty array of fixture ids`);
+    }
+    const members: Fixture[] = [];
+    for (const m of zs.members) {
+      const fx = fixturesById.get(m);
+      if (!fx) {
+        throw new Error(`zone "${zs.id}": unknown fixture "${m}"`);
+      }
+      members.push(fx);
+    }
+    // Intersection of member characteristics — HomeKit only exposes what
+    // ALL members can do.
+    let chars = new Set<HKCharacteristic>(members[0].profile.model.characteristics);
+    for (let i = 1; i < members.length; i++) {
+      const mc = new Set<HKCharacteristic>(members[i].profile.model.characteristics);
+      chars = new Set([...chars].filter((c) => mc.has(c)));
+    }
+    zones.push({
+      id: zs.id,
+      name: zs.name || zs.id,
+      members,
+      characteristics: [...chars],
+    });
+  }
+
   return {
     name: raw.name ?? DEFAULT_PLATFORM_NAME,
     controllers: [...controllersById.values()],
     fixtures,
+    zones,
   };
 }

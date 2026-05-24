@@ -1,7 +1,7 @@
 {
   "name": "@ecopoesis/homebridge-dmx",
   "displayName": "DMX",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Homebridge platform for DMX controllers (currently Nicolaudie Stick-DE3)",
   "license": "Apache-2.0",
   "type": "module",
