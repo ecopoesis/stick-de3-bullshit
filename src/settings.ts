@@ -1,7 +1,7 @@
 // Homebridge plugin constants.
 
 export const PLATFORM_NAME = 'StickDe3';
-export const PLUGIN_NAME = 'homebridge-stick-de3';
+export const PLUGIN_NAME = 'homebridge-dmx';
 
 /** Coalesce HomeKit's multi-characteristic dispatch (Hue+Sat+Brightness
  *  arrive as 3 separate sets when picking a color). Mirrors unifi-ap-rgb. */

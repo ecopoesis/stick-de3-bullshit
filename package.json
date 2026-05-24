@@ -1,5 +1,5 @@
 {
-  "name": "homebridge-stick-de3",
+  "name": "homebridge-dmx",
   "displayName": "WAC DMX via Stick-DE3",
   "version": "0.0.1",
   "description": "Control WAC Lighting DC-WD05 fixtures via Nicolaudie Stick-DE3 DMX controller",
@@ -7,7 +7,7 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ecopoesis/homebridge-stick-de3.git"
+    "url": "git+https://github.com/ecopoesis/homebridge-dmx.git"
   },
   "engines": {
     "node": ">=18.15.0",
