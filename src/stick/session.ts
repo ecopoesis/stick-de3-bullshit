@@ -29,6 +29,52 @@ import {
   sleep,
   waitFor,
 } from './protocol.js';
+
+// HWM-faithful UDP broadcasts. 4 magics × 3 bursts on UDP/2430, plus a
+// "LIGHTINGSOFT_XHL Hardware Manager" announce on UDP/24299. Verified
+// 2026-05-24: not optional — without them, sessions after a Stick
+// power-cycle silently fail to actually drive output even though the
+// TCP handshake reports go-live success.
+const DISCOVERY_MAGICS = ['LSAG_ALL', 'Stick_U1', 'Stick_3A', 'Siudi_7B'];
+const DISCOVERY_TAIL = Buffer.from('000014000000', 'hex');
+
+async function discoveryBroadcast(udp: dgram.Socket): Promise<void> {
+  for (let burst = 0; burst < 3; burst++) {
+    for (const m of DISCOVERY_MAGICS) {
+      const pkt = Buffer.concat([Buffer.from(m, 'ascii'), DISCOVERY_TAIL]);
+      await new Promise<void>((r) => udp.send(pkt, 2430, '255.255.255.255', () => r()));
+    }
+    await sleep(25);
+  }
+}
+
+const XHL_HEADER = Buffer.from(
+  '4c49474854494e47534f46545f58484c' +
+  '0000000000000000' +
+  '14000000' +
+  '01000000',
+  'hex',
+);
+
+async function announceHardwareManager(
+  udp24299: dgram.Socket,
+  instanceId: Buffer,
+): Promise<void> {
+  const body114 = Buffer.alloc(114 - 32);
+  instanceId.copy(body114, 0);
+  body114.writeUInt32LE(crypto.randomBytes(4).readUInt32LE(0), 8);
+  body114.writeUInt32LE(11, 12);
+  body114.write('Hardware Manager\0', 18, 'ascii');
+  const pkt114 = Buffer.concat([XHL_HEADER, body114]);
+  await new Promise<void>((r) => udp24299.send(pkt114, 24299, '255.255.255.255', () => r()));
+  await sleep(25);
+  for (let i = 0; i < 2; i++) {
+    const tail = Buffer.concat([crypto.randomBytes(4), Buffer.from([0x0a + i * 2, 0])]);
+    const pkt46 = Buffer.concat([XHL_HEADER, instanceId, tail]);
+    await new Promise<void>((r) => udp24299.send(pkt46, 24299, '255.255.255.255', () => r()));
+    await sleep(25);
+  }
+}
 import { deriveDmxKey, makeEphemeral, pointToWire, wireToPoint } from './kdf.js';
 import { buildFrame } from './frame.js';
 
@@ -49,6 +95,12 @@ export interface SessionOpts {
   tokenStart?: number;
   /** Optional logger; default no-op. */
   log?: (...args: unknown[]) => void;
+  /** Caller-owned UDP socket (bound to UDP_SRC_PORT 2430). When supplied,
+   *  the session uses it for DMX sends + does NOT close it on destroy().
+   *  Used by StickController to avoid the close-then-rebind cycle that
+   *  empirically poisons the Stick into rejecting subsequent sessions
+   *  inside a long-lived plugin process. */
+  udp?: dgram.Socket;
 }
 
 const env = (k: string): string | undefined => process.env[k];
@@ -60,17 +112,18 @@ export class StickSession {
     public readonly ip: string,
     private sock: net.Socket,
     private udp: dgram.Socket,
+    /** When true, we own the UDP socket and must close it on destroy(). */
+    private ownsUdp: boolean,
     private key: Buffer,
     private token: Token,
     private rxBuf: Buffer,
-    public readonly opts: Required<Omit<SessionOpts, 'log'>> & { log: (...a: unknown[]) => void },
   ) {}
 
   /** Open the TCP/2431 control channel, run the handshake (auth → pre-DMX
    *  chatter → ECDH → optional sector reads → go-live), and return a session
    *  ready for `send()`. */
   static async connect(ip: string, opts: SessionOpts = {}): Promise<StickSession> {
-    const resolved: Required<Omit<SessionOpts, 'log'>> & { log: (...a: unknown[]) => void } = {
+    const resolved = {
       port:        opts.port        ?? TCP_PORT,
       chatterMs:   opts.chatterMs   ?? envNum('CHATTER_MS', 10),
       settle2eMs:  opts.settle2eMs  ?? envNum('SETTLE_2E_MS', 50),
@@ -78,18 +131,40 @@ export class StickSession {
       runProbe:    opts.runProbe    ?? env('RUN_PROBE') === '1',
       probeGapMs:  opts.probeGapMs  ?? envNum('PROBE_GAP_MS', 800),
       tokenStart:  opts.tokenStart  ?? 0x80,
-      log:         opts.log         ?? (() => {}),
+      log:         opts.log         ?? ((): void => undefined),
     };
     const log = resolved.log;
     const token = new Token(resolved.tokenStart);
 
-    // UDP socket for the DMX stream + (silently) discovery, though we no
-    // longer broadcast (Stick is reached by static IP).
-    const udp = dgram.createSocket('udp4');
-    await new Promise<void>((res, rej) => {
-      udp.once('error', rej);
-      udp.bind(UDP_SRC_PORT, () => { udp.setBroadcast(true); res(); });
-    });
+    // UDP socket for the DMX stream + the HWM-faithful broadcasts. If the
+    // caller (the controller, when running in a long-lived plugin process)
+    // owns one, we reuse it; otherwise we create one for this session and
+    // close it on destroy(). See the comment on SessionOpts.udp.
+    let udp: dgram.Socket;
+    let ownsUdp = false;
+    if (opts.udp) {
+      udp = opts.udp;
+    } else {
+      ownsUdp = true;
+      udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+      await new Promise<void>((res, rej) => {
+        udp.once('error', rej);
+        udp.bind(UDP_SRC_PORT, () => { udp.setBroadcast(true); res(); });
+      });
+    }
+    await discoveryBroadcast(udp);
+    const udp24299 = dgram.createSocket('udp4');
+    try {
+      await new Promise<void>((res, rej) => {
+        udp24299.once('error', rej);
+        udp24299.bind(24299, () => { udp24299.setBroadcast(true); res(); });
+      });
+      const instanceId = crypto.randomBytes(8);
+      await announceHardwareManager(udp24299, instanceId);
+    } finally {
+      udp24299.close();
+    }
+    await sleep(200);
 
     if (resolved.runProbe) {
       const probe = await openTcp(ip, resolved.port);
@@ -119,36 +194,21 @@ export class StickSession {
 
     await doAuth(sock, () => rxBuf.v, token, '[live]', log);
 
-    // Pre-DMX chatter — sent ONE AT A TIME with a small gap. We split the
-    // sequence into TWO groups around the 0x00 → 0xc9 round-trip so we can
-    // wait explicitly for 0xc9. Without the explicit wait, a cold-start
-    // Stick that takes >chatterMs to reply causes 0xc9 to land AFTER we've
-    // already cleared rxBuf, the session is silently un-registered, and
-    // the rest of the handshake "succeeds" but go-live never grants. We saw
-    // this 1-in-N cold-start: subsequent runs were fine because the Stick
-    // had warmed up, but the first run after idle would not latch.
+    // Pre-DMX chatter — match send_dmx.mjs EXACTLY (which is empirically
+    // known to work multi-session from fresh processes). Earlier attempt
+    // to wait explicitly for 0xc9 in the middle may have been wrong.
     for (const m of [
       msg(MAGIC, 0x46, Buffer.alloc(4)),
       msg(MAGIC, 0x09, Buffer.from('14000000', 'hex')),
       msg(MAGIC, 0x09, Buffer.from('14000000', 'hex')),
-    ]) {
-      sock.write(m);
-      await sleep(resolved.chatterMs);
-    }
-    sock.write(msg(MAGIC, 0x00, Buffer.from('14000000', 'hex')));
-    const c9 = await waitFor(() => findMsg(rxBuf.v, 0x00c9, 18), 2000);
-    if (c9) {
-      log('0xc9 status received — session registered');
-    } else {
-      log('0xc9 NOT received within 2s — Stick may not be registered');
-    }
-    for (const m of [
+      msg(MAGIC, 0x00, Buffer.from('14000000', 'hex')),
       msg(MAGIC, 0x011c, token.next(), Buffer.from('01001600', 'hex')),
       msg(MAGIC, 0x05, Buffer.from('0200', 'hex')),
     ]) {
       sock.write(m);
       await sleep(resolved.chatterMs);
     }
+    if (findMsg(rxBuf.v, 0x00c9, 18)) log('0xc9 status received — session registered');
 
     // 0x10 — crypto-state query
     rxBuf.v = Buffer.alloc(0);
@@ -212,7 +272,7 @@ export class StickSession {
     const r10b = await waitFor(() => findMsg(rxBuf.v, 0x10, 22), 1500);
     if (r10b) log(`0x10 after 0x11 — crypto state ${r10b.readUInt32LE(0x12)}`);
 
-    return new StickSession(ip, sock, udp, key, token, rxBuf.v, resolved);
+    return new StickSession(ip, sock, udp, ownsUdp, key, token, rxBuf.v);
   }
 
   /** Per-frame sequence counter (low byte). */
@@ -235,7 +295,9 @@ export class StickSession {
    *  it received (cf. memory note `stick-actually-latches-on-clean-disconnect`).
    *  Idempotent. */
   destroy(): void {
-    try { this.udp.close(); } catch { /* already closed */ }
+    if (this.ownsUdp) {
+      try { this.udp.close(); } catch { /* already closed */ }
+    }
     try { this.sock.destroy(); } catch { /* already destroyed */ }
   }
 }

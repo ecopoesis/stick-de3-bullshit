@@ -89,6 +89,13 @@ export class StickFixture {
     if (this.pending) clearTimeout(this.pending);
     this.pending = setTimeout(() => {
       this.pending = null;
+      const s = this.state;
+      this.platform.log.info(
+        `[${this.fixture.id}] HK set: on=${s.on} br=${s.brightness}` +
+        (s.hue != null ? ` h=${s.hue}` : '') +
+        (s.saturation != null ? ` s=${s.saturation}` : '') +
+        (s.colorTemperatureMireds != null ? ` ct=${s.colorTemperatureMireds}` : ''),
+      );
       this.controller.setFixture(this.fixture, this.state);
     }, CHARACTERISTIC_UPDATE_DELAY_MS);
   }
