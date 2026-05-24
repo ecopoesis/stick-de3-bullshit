@@ -2,8 +2,8 @@
 
 import type { API } from 'homebridge';
 import { PLATFORM_NAME } from './settings.js';
-import { StickDe3Platform } from './platform.js';
+import { DmxPlatform } from './platform.js';
 
 export default (api: API): void => {
-  api.registerPlatform(PLATFORM_NAME, StickDe3Platform);
+  api.registerPlatform(PLATFORM_NAME, DmxPlatform);
 };

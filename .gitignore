@@ -16,3 +16,7 @@ tools/.omc/
 tools/dmx-relay/.omc/
 .omc/
 .claude/
+
+homebridge-dmx-*.tgz
+@ecopoesis-homebridge-dmx-*.tgz
+ecopoesis-homebridge-dmx-*.tgz

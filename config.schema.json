@@ -1,30 +1,56 @@
 {
-  "pluginAlias": "StickDe3",
+  "pluginAlias": "DMX",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "WAC DMX via Nicolaudie Stick-DE3 — see the README for the YAML override path if the schema below is too constrained for your fixtures.",
-  "footerDisplay": "Tip: complex patches (many fixtures, custom profiles) are easiest to maintain in a YAML file pointed to by **yamlPath**. The YAML file replaces the JSON fields entirely.",
+  "headerDisplay": "Homebridge platform for DMX controllers. Currently supports the Nicolaudie Stick-DE3; the controller abstraction is structured so additional DMX controllers can be added later without rewriting your patch.",
+  "footerDisplay": "For larger setups, point **yamlPath** at an external YAML file containing the controllers + profiles + patch. The YAML replaces the inline JSON below entirely.",
   "schema": {
     "type": "object",
     "properties": {
       "name": {
         "title": "Platform Name",
         "type": "string",
-        "default": "Stick-DE3 DMX",
+        "default": "DMX",
         "required": false
-      },
-      "ip": {
-        "title": "Stick-DE3 IP Address",
-        "type": "string",
-        "format": "ipv4",
-        "description": "Static IP of the Stick on its DMX VLAN (e.g. 192.168.96.2). Discovery is not supported.",
-        "required": true
       },
       "yamlPath": {
         "title": "YAML config path (optional)",
         "type": "string",
         "description": "Absolute or relative path to a YAML file containing the full config. When set, the YAML replaces the JSON fields below.",
         "required": false
+      },
+      "controllers": {
+        "title": "DMX Controllers",
+        "type": "array",
+        "required": false,
+        "description": "One entry per physical controller. Patch entries below reference these by id.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "title": "Controller id",
+              "type": "string",
+              "required": true,
+              "description": "kebab-case identifier; referenced from patch entries."
+            },
+            "type": {
+              "title": "Controller type",
+              "type": "string",
+              "required": true,
+              "default": "StickDE3",
+              "oneOf": [
+                { "title": "Nicolaudie Stick-DE3", "enum": ["StickDE3"] }
+              ]
+            },
+            "ip": {
+              "title": "IP address",
+              "type": "string",
+              "format": "ipv4",
+              "required": true,
+              "description": "Static IP of the controller on its DMX VLAN (e.g. 192.168.96.2). Discovery is not supported."
+            }
+          }
+        }
       },
       "profiles": {
         "title": "Fixture Profiles",
@@ -71,16 +97,15 @@
           "type": "object",
           "properties": {
             "id": {
-              "title": "ID",
+              "title": "Fixture id",
               "type": "string",
               "required": true,
-              "description": "kebab-case identifier; used as the fixture's stable handle."
+              "description": "kebab-case identifier; the fixture's stable handle."
             },
             "name": {
               "title": "HomeKit name",
               "type": "string",
-              "required": true,
-              "description": "Displayed in the Home app."
+              "required": true
             },
             "type": {
               "title": "Profile",
@@ -88,13 +113,19 @@
               "required": true,
               "description": "Must match a Profile name above."
             },
+            "controller": {
+              "title": "Controller",
+              "type": "string",
+              "required": false,
+              "description": "Controller id this fixture is wired to. Optional when only one controller is configured."
+            },
             "universe": {
               "title": "DMX universe",
               "type": "string",
               "default": "A",
               "oneOf": [
                 { "title": "A", "enum": ["A"] },
-                { "title": "B (currently untested — see README)", "enum": ["B"] }
+                { "title": "B (untested)", "enum": ["B"] }
               ]
             },
             "start": {

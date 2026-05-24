@@ -23,8 +23,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Buffer } from 'node:buffer';
+import yaml from 'js-yaml';
 
-import { LoadedConfig, loadConfig } from '../config.js';
+import { LoadedConfig, loadConfig, RawConfig } from '../config.js';
 import { parseValue } from '../color/parsers.js';
 import { StickSession } from '../stick/session.js';
 
@@ -79,12 +80,15 @@ function loadOptionalConfig(configPath: string | null, ip: string): LoadedConfig
   const p = configPath ?? findDefaultConfig();
   if (!p) return null;
   const cwd = path.dirname(p);
-  if (p.endsWith('.yaml') || p.endsWith('.yml')) {
-    return loadConfig({ ip, yamlPath: p }, cwd);
+  const text = fs.readFileSync(p, 'utf8');
+  const raw: RawConfig & { ip?: string } =
+    p.endsWith('.yaml') || p.endsWith('.yml') ? (yaml.load(text) as RawConfig) : JSON.parse(text);
+  // CLI convenience: if the config doesn't define controllers, synthesize
+  // one from the cmdline ip (or a legacy top-level `ip:` field).
+  if (!raw.controllers || raw.controllers.length === 0) {
+    raw.controllers = [{ id: 'cli', type: 'StickDE3', ip: raw.ip ?? ip }];
   }
-  const json = JSON.parse(fs.readFileSync(p, 'utf8'));
-  if (!json.ip) json.ip = ip;
-  return loadConfig(json, cwd);
+  return loadConfig(raw, cwd);
 }
 
 // Build a Map<universe, Uint8Array(512)> of channel targets from CLI args.

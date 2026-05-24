@@ -1,17 +1,18 @@
 // Homebridge plugin constants.
 
-export const PLATFORM_NAME = 'StickDe3';
-export const PLUGIN_NAME = 'homebridge-dmx';
+export const PLATFORM_NAME = 'DMX';
+export const PLUGIN_NAME = '@ecopoesis/homebridge-dmx';
 
 /** Coalesce HomeKit's multi-characteristic dispatch (Hue+Sat+Brightness
  *  arrive as 3 separate sets when picking a color). Mirrors unifi-ap-rgb. */
 export const CHARACTERISTIC_UPDATE_DELAY_MS = 50;
 
-/** Streaming "send until quiet" window. After the LAST HomeKit change, we
- *  keep streaming for this long, then dirty-disconnect → Stick latches.
- *  Empirical floor for the Stick's commit timer is ~500 ms; this leaves a
- *  comfortable margin. */
+/** "Send until quiet" debounce. After the LAST HomeKit change, we wait
+ *  this long before spawning the send_dmx subprocess. Coalesces a fast
+ *  slider drag into one transaction. */
 export const DEBOUNCE_MS = 750;
 
-/** Frame interval (40ms = 25Hz, matches HWM exactly). */
+/** Frame interval (40ms = 25Hz, matches HWM exactly). Unused by the
+ *  subprocess controller — send_dmx.mjs's own FRAME_HZ env knob is what
+ *  matters now. */
 export const FRAME_INTERVAL_MS = 40;

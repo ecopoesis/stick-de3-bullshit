@@ -1,0 +1,65 @@
+# Example homebridge-dmx config.
+#
+# Save this to e.g. /opt/containers/homebridge/dmx.yaml (path visible inside
+# the container as /homebridge/dmx.yaml) and reference it from Homebridge's
+# config.json with:
+#
+#   "platforms": [{
+#     "platform": "DMX",
+#     "yamlPath": "/homebridge/dmx.yaml"
+#   }]
+
+controllers:
+  # One entry per physical DMX controller. Currently only StickDE3 is
+  # supported; the abstraction is here so other controller types can be
+  # added later without rewriting your patch.
+  - id: main
+    type: StickDE3
+    ip: 192.168.96.2
+
+profiles:
+  # Fixture types. Each profile names a color model + the order its DMX
+  # channels appear in. "(Fine)" makes a channel the low byte of a 16-bit
+  # companion to the preceding channel. CCT channels carry their K range.
+  - name: WAC
+    colormodel: hsvcct
+    channel_order:
+      - Intensity
+      - Intensity (Fine)
+      - ColorTemp 1650-8000
+      - Saturation
+      - Hue
+
+  - name: CustomRGB
+    colormodel: rgb
+    channel_order:
+      - Blue
+      - Green
+      - Red
+
+  - name: Dimmer
+    colormodel: dimmer
+    channel_order:
+      - Intensity
+
+patch:
+  # One entry per physical fixture. `controller` is optional when only one
+  # controller is configured. `universe` defaults to A.
+  - id: a_down
+    name: A Down
+    type: WAC
+    controller: main
+    universe: A
+    start: 6
+
+  - id: post_light
+    name: Post Light
+    type: CustomRGB
+    controller: main
+    start: 100
+
+  - id: shed_dimmer
+    name: Shed Dimmer
+    type: Dimmer
+    controller: main
+    start: 200

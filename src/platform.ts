@@ -1,7 +1,8 @@
-// StickDe3Platform — Homebridge DynamicPlatformPlugin entry.
+// DmxPlatform — Homebridge DynamicPlatformPlugin entry.
 //
-// Discovers fixtures from the loaded config, creates one Lightbulb accessory
-// per patch entry, and owns the single shared StickController.
+// Loads the config, instantiates one StickController per controller spec,
+// creates one Lightbulb accessory per patch entry, wires each accessory to
+// its controller.
 
 import type {
   API,
@@ -13,18 +14,18 @@ import type {
   Service,
 } from 'homebridge';
 
-import { LoadedConfig, loadConfig, RawConfig } from './config.js';
+import { Controller, LoadedConfig, loadConfig, RawConfig } from './config.js';
 import { StickController } from './controller.js';
 import { StickFixture } from './platformAccessory.js';
 import { PLATFORM_NAME, PLUGIN_NAME } from './settings.js';
 
-export class StickDe3Platform implements DynamicPlatformPlugin {
+export class DmxPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
   public readonly accessories: PlatformAccessory[] = [];
 
   private cfg: LoadedConfig | null = null;
-  private controller: StickController | null = null;
+  private controllers = new Map<string, StickController>();
 
   constructor(
     public readonly log: Logger,
@@ -44,41 +45,61 @@ export class StickDe3Platform implements DynamicPlatformPlugin {
       return;
     }
 
-    this.controller = new StickController(this.cfg.ip, this.log);
+    for (const c of this.cfg.controllers) {
+      this.controllers.set(c.id, this.makeController(c));
+    }
+
     this.log.info(
-      `Stick-DE3 platform configured: ip=${this.cfg.ip}, ` +
+      `DMX platform configured: ${this.cfg.controllers.length} controller` +
+      `${this.cfg.controllers.length === 1 ? '' : 's'}, ` +
       `${this.cfg.fixtures.length} fixture${this.cfg.fixtures.length === 1 ? '' : 's'}`,
     );
 
     this.api.on('didFinishLaunching', () => this.discoverDevices());
-    this.api.on('shutdown', () => this.controller?.shutdown());
+    this.api.on('shutdown', () => {
+      for (const c of this.controllers.values()) c.shutdown();
+    });
   }
 
-  /** Called by Homebridge for each cached accessory at startup. We hold
-   *  onto them in `this.accessories` and (re)wire them in `discoverDevices`. */
+  private makeController(c: Controller): StickController {
+    switch (c.type) {
+      case 'StickDE3':
+        return new StickController(c.ip, this.log);
+      default:
+        throw new Error(`unsupported controller type "${(c as Controller).type}"`);
+    }
+  }
+
+  /** Called by Homebridge for each cached accessory at startup. */
   configureAccessory(accessory: PlatformAccessory): void {
     this.log.debug(`restoring cached accessory: ${accessory.displayName}`);
     this.accessories.push(accessory);
   }
 
   private discoverDevices(): void {
-    if (!this.cfg || !this.controller) return;
+    if (!this.cfg) return;
 
     const wantUuids = new Set<string>();
     for (const fx of this.cfg.fixtures) {
-      const uuid = this.api.hap.uuid.generate(`stick-de3:${fx.id}`);
+      const uuid = this.api.hap.uuid.generate(`dmx:${fx.controller.id}:${fx.id}`);
       wantUuids.add(uuid);
+
+      const controller = this.controllers.get(fx.controller.id);
+      if (!controller) {
+        this.log.error(`fixture "${fx.id}": no controller "${fx.controller.id}"`);
+        continue;
+      }
 
       const existing = this.accessories.find((a) => a.UUID === uuid);
       if (existing) {
         this.log.debug(`wiring cached accessory ${fx.id}`);
-        existing.context.fixture = { id: fx.id }; // light marker; live ref kept in closure
-        new StickFixture(this, existing, fx, this.controller);
+        existing.context.fixture = { id: fx.id, controllerId: fx.controller.id };
+        new StickFixture(this, existing, fx, controller);
       } else {
         this.log.info(`registering new accessory: ${fx.name} (${fx.id})`);
         const accessory = new this.api.platformAccessory(fx.name, uuid);
-        accessory.context.fixture = { id: fx.id };
-        new StickFixture(this, accessory, fx, this.controller);
+        accessory.context.fixture = { id: fx.id, controllerId: fx.controller.id };
+        new StickFixture(this, accessory, fx, controller);
         this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
         this.accessories.push(accessory);
       }
@@ -88,7 +109,6 @@ export class StickDe3Platform implements DynamicPlatformPlugin {
     if (stale.length) {
       this.log.info(`unregistering ${stale.length} stale accessor${stale.length === 1 ? 'y' : 'ies'}`);
       this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, stale);
-      // drop them from our local list too
       for (const a of stale) {
         const i = this.accessories.indexOf(a);
         if (i >= 0) this.accessories.splice(i, 1);

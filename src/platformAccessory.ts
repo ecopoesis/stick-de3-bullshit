@@ -9,7 +9,7 @@ import type {
 import { Fixture } from './config.js';
 import { HomeKitLightState } from './color/types.js';
 import { StickController } from './controller.js';
-import type { StickDe3Platform } from './platform.js';
+import type { DmxPlatform } from './platform.js';
 import { CHARACTERISTIC_UPDATE_DELAY_MS } from './settings.js';
 
 export class StickFixture {
@@ -21,7 +21,7 @@ export class StickFixture {
   private pending: NodeJS.Timeout | null = null;
 
   constructor(
-    private readonly platform: StickDe3Platform,
+    private readonly platform: DmxPlatform,
     private readonly accessory: PlatformAccessory,
     private readonly fixture: Fixture,
     private readonly controller: StickController,

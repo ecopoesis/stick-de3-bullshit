@@ -1,16 +1,37 @@
 // Config loader + validator.
 //
 // Inputs:
-//   - Homebridge config: `platforms[].StickDe3` block from Homebridge's
-//     config.json. Required top-level field `ip`. Optional `yamlPath` points
-//     to an external YAML file whose contents take precedence over the JSON.
+//   - Homebridge config: `platforms[].DMX` block from Homebridge's
+//     config.json. Optional `yamlPath` points to an external YAML file
+//     whose contents take precedence over the JSON.
 //   - YAML override: same shape as the JSON block.
 //
+// Shape:
+//   {
+//     "platform": "DMX",
+//     "name": "DMX",
+//     "yamlPath": "/optional/path/to/dmx.yaml",
+//     "controllers": [
+//       { "id": "main", "type": "StickDE3", "ip": "192.168.96.2" }
+//     ],
+//     "profiles": [
+//       { "name": "WAC", "colormodel": "hsvcct",
+//         "channel_order": ["Intensity", "Intensity (Fine)",
+//                           "ColorTemp 1650-8000", "Saturation", "Hue"] }
+//     ],
+//     "patch": [
+//       { "id": "a_down", "name": "A Down", "type": "WAC",
+//         "controller": "main", "universe": "A", "start": 6 }
+//     ]
+//   }
+//
 // Output: a normalized `LoadedConfig` the platform consumes. Validates:
-//   - profiles: each `colormodel` is recognised, channel_order parses cleanly
-//     and is consistent with the model's requirements
-//   - patch: unique ids, valid universe ∈ {A, B}, start ∈ [1, 512-nch+1],
-//     non-overlapping DMX ranges within a universe
+//   - controllers: unique ids, supported type, ip present
+//   - profiles: colormodel recognised, channel_order parses cleanly, model
+//     requirements satisfied
+//   - patch: unique ids, references a known profile + controller, valid
+//     universe ∈ {A,B}, start in [1, 512-nch+1], no slot overlap within a
+//     single (controller, universe).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,6 +40,12 @@ import yaml from 'js-yaml';
 import { ChannelDef, ColorModel } from './color/types.js';
 import { getColorModel } from './color/index.js';
 import { parseChannelName } from './color/parsers.js';
+
+export interface ControllerSpec {
+  id: string;            // unique handle, referenced from patch entries
+  type: string;          // 'StickDE3' (only one supported today)
+  ip: string;            // controller's static IP
+}
 
 export interface ProfileSpec {
   name: string;
@@ -30,14 +57,15 @@ export interface PatchSpec {
   id: string;            // unique handle (kebab-case)
   name: string;          // human-friendly HomeKit name
   type: string;          // profile name (refers to a ProfileSpec.name)
+  controller?: string;   // controller id; required if >1 controller configured
   universe?: string;     // 'A' or 'B'; default 'A'
   start: number;         // 1-based DMX start address
 }
 
 export interface RawConfig {
-  ip: string;
-  name?: string;         // platform display name in Homebridge
+  name?: string;
   yamlPath?: string;
+  controllers?: ControllerSpec[];
   profiles?: ProfileSpec[];
   patch?: PatchSpec[];
 }
@@ -48,22 +76,32 @@ export interface Profile {
   channels: ChannelDef[];
 }
 
+export const CONTROLLER_TYPES = ['StickDE3'] as const;
+export type ControllerType = typeof CONTROLLER_TYPES[number];
+
+export interface Controller {
+  id: string;
+  type: ControllerType;
+  ip: string;
+}
+
 export interface Fixture {
   id: string;
   name: string;
   profile: Profile;
+  controller: Controller;
   universe: number;      // 0 (A) or 1 (B)
   startCh: number;       // 1..512
   nChannels: number;     // = channels.length
 }
 
 export interface LoadedConfig {
-  ip: string;
   name: string;
+  controllers: Controller[];
   fixtures: Fixture[];
 }
 
-export const DEFAULT_PLATFORM_NAME = 'Stick-DE3 DMX';
+export const DEFAULT_PLATFORM_NAME = 'DMX';
 
 /** Load + validate the platform config. `rawJson` is the Homebridge
  *  `platforms[]` entry; if it specifies `yamlPath`, that YAML file is loaded
@@ -80,12 +118,30 @@ export function loadConfig(rawJson: RawConfig, cwd?: string): LoadedConfig {
     if (!parsed || typeof parsed !== 'object') {
       throw new Error(`yamlPath ${p}: not an object`);
     }
-    // YAML overrides JSON, but inherit ip/name if YAML omits them
     raw = { ...rawJson, ...parsed };
   }
 
-  if (!raw.ip || typeof raw.ip !== 'string') {
-    throw new Error('config: required field "ip" missing');
+  // Controllers
+  const controllerSpecs = raw.controllers ?? [];
+  if (controllerSpecs.length === 0) {
+    throw new Error('config: at least one controller required under "controllers"');
+  }
+  const controllersById = new Map<string, Controller>();
+  for (const cs of controllerSpecs) {
+    if (!cs.id) throw new Error('controller: missing id');
+    if (controllersById.has(cs.id)) {
+      throw new Error(`controller: duplicate id "${cs.id}"`);
+    }
+    if (!CONTROLLER_TYPES.includes(cs.type as ControllerType)) {
+      throw new Error(
+        `controller "${cs.id}": unknown type "${cs.type}". ` +
+        `Supported: ${CONTROLLER_TYPES.join(', ')}`,
+      );
+    }
+    if (!cs.ip || typeof cs.ip !== 'string') {
+      throw new Error(`controller "${cs.id}": required field "ip" missing`);
+    }
+    controllersById.set(cs.id, { id: cs.id, type: cs.type as ControllerType, ip: cs.ip });
   }
 
   // Profiles
@@ -114,8 +170,15 @@ export function loadConfig(rawJson: RawConfig, cwd?: string): LoadedConfig {
   const patchSpecs = raw.patch ?? [];
   const fixtures: Fixture[] = [];
   const seenIds = new Set<string>();
-  // 2 universes × 512 channels, tracking which fixture (if any) owns each slot
-  const occupancy: Map<number, Map<number, string>> = new Map([[0, new Map()], [1, new Map()]]);
+  // Per controller + per universe: 512 channels, tracking which fixture
+  // owns each slot. Key is `${controllerId}:${universe}`.
+  const occupancy: Map<string, Map<number, string>> = new Map();
+  const slots = (cid: string, u: number): Map<number, string> => {
+    const key = `${cid}:${u}`;
+    let m = occupancy.get(key);
+    if (!m) { m = new Map(); occupancy.set(key, m); }
+    return m;
+  };
 
   for (const ps of patchSpecs) {
     if (!ps.id) throw new Error('patch: missing id');
@@ -126,6 +189,21 @@ export function loadConfig(rawJson: RawConfig, cwd?: string): LoadedConfig {
     const profile = profilesByName.get(ps.type);
     if (!profile) {
       throw new Error(`patch "${ps.id}": unknown profile "${ps.type}"`);
+    }
+    // controller reference. If only one controller is configured, default to it.
+    let controllerId = ps.controller;
+    if (!controllerId) {
+      if (controllersById.size === 1) {
+        controllerId = controllersById.keys().next().value as string;
+      } else {
+        throw new Error(
+          `patch "${ps.id}": "controller" required when more than one controller is configured`,
+        );
+      }
+    }
+    const controller = controllersById.get(controllerId);
+    if (!controller) {
+      throw new Error(`patch "${ps.id}": unknown controller "${controllerId}"`);
     }
     const universeChar = (ps.universe ?? 'A').toUpperCase();
     if (universeChar !== 'A' && universeChar !== 'B') {
@@ -139,21 +217,23 @@ export function loadConfig(rawJson: RawConfig, cwd?: string): LoadedConfig {
         `patch "${ps.id}": start ${ps.start} + ${nch} channels does not fit in 1..512`,
       );
     }
-    const slots = occupancy.get(universe)!;
+    const slotMap = slots(controllerId, universe);
     for (let i = 0; i < nch; i++) {
       const slot = start + i;
-      const owner = slots.get(slot);
+      const owner = slotMap.get(slot);
       if (owner) {
         throw new Error(
-          `patch "${ps.id}": DMX slot ${slot}@${universeChar} overlaps with "${owner}"`,
+          `patch "${ps.id}": DMX slot ${slot}@${universeChar} ` +
+          `(controller "${controllerId}") overlaps with "${owner}"`,
         );
       }
-      slots.set(slot, ps.id);
+      slotMap.set(slot, ps.id);
     }
     fixtures.push({
       id: ps.id,
       name: ps.name || ps.id,
       profile,
+      controller,
       universe,
       startCh: start,
       nChannels: nch,
@@ -161,8 +241,8 @@ export function loadConfig(rawJson: RawConfig, cwd?: string): LoadedConfig {
   }
 
   return {
-    ip: raw.ip,
     name: raw.name ?? DEFAULT_PLATFORM_NAME,
+    controllers: [...controllersById.values()],
     fixtures,
   };
 }
