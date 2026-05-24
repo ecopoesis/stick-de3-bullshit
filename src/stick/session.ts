@@ -119,20 +119,36 @@ export class StickSession {
 
     await doAuth(sock, () => rxBuf.v, token, '[live]', log);
 
-    // Pre-DMX chatter — sent ONE AT A TIME with a small gap. Coalesced sends
-    // were historically observed to leave the Stick without sending 0xc9.
+    // Pre-DMX chatter — sent ONE AT A TIME with a small gap. We split the
+    // sequence into TWO groups around the 0x00 → 0xc9 round-trip so we can
+    // wait explicitly for 0xc9. Without the explicit wait, a cold-start
+    // Stick that takes >chatterMs to reply causes 0xc9 to land AFTER we've
+    // already cleared rxBuf, the session is silently un-registered, and
+    // the rest of the handshake "succeeds" but go-live never grants. We saw
+    // this 1-in-N cold-start: subsequent runs were fine because the Stick
+    // had warmed up, but the first run after idle would not latch.
     for (const m of [
       msg(MAGIC, 0x46, Buffer.alloc(4)),
       msg(MAGIC, 0x09, Buffer.from('14000000', 'hex')),
       msg(MAGIC, 0x09, Buffer.from('14000000', 'hex')),
-      msg(MAGIC, 0x00, Buffer.from('14000000', 'hex')),
+    ]) {
+      sock.write(m);
+      await sleep(resolved.chatterMs);
+    }
+    sock.write(msg(MAGIC, 0x00, Buffer.from('14000000', 'hex')));
+    const c9 = await waitFor(() => findMsg(rxBuf.v, 0x00c9, 18), 2000);
+    if (c9) {
+      log('0xc9 status received — session registered');
+    } else {
+      log('0xc9 NOT received within 2s — Stick may not be registered');
+    }
+    for (const m of [
       msg(MAGIC, 0x011c, token.next(), Buffer.from('01001600', 'hex')),
       msg(MAGIC, 0x05, Buffer.from('0200', 'hex')),
     ]) {
       sock.write(m);
       await sleep(resolved.chatterMs);
     }
-    if (findMsg(rxBuf.v, 0x00c9, 18)) log('0xc9 status received — session registered');
 
     // 0x10 — crypto-state query
     rxBuf.v = Buffer.alloc(0);
