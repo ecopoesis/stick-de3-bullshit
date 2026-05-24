@@ -428,8 +428,12 @@ async function main() {
   // Goal: minimise streaming time. The Stick is unusable from elsewhere while
   // we hold the TCP/2431 session, so for a Homebridge plugin doing single-
   // command updates we want to be in-and-out as fast as possible.
+  // Empirical (user test 2026-05-23): the Stick needs ~12 DMX frames after
+  // go-live before it'll commit values. 100/200/300/400 ms all failed to
+  // latch; 500 ms worked. Default 750 ms = ~19 frames, ~50% margin against
+  // scheduler/network jitter. Override with STREAM_MS to push lower.
   sock.write(msg(MAGIC, 0x10, token()));
-  const STREAM_MS = Number(process.env.STREAM_MS || 500);   // was 20000; now 500
+  const STREAM_MS = Number(process.env.STREAM_MS || 750);
   let nFrames = 0;
 
   const udpTimer = setInterval(() => {                       // 25 Hz, like HWM
