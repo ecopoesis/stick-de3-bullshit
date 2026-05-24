@@ -24,6 +24,7 @@
 import net from 'node:net';
 import dgram from 'node:dgram';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { makeEphemeral, deriveDmxKey, pointToWire, wireToPoint } from './derive-dmx-key.mjs';
 
 const TCP_PORT = 2431;
@@ -192,43 +193,134 @@ async function handshake(sock) {
   // 6. derive the DMX session key (KDF: P-256 double-ECDH)
   const key = deriveDmxKey(ecdh, wireToPoint(Qwire));
   log('DMX key derived:', key.toString('hex'));
+  // dump key + ephemeral private d so a capture can be decrypted offline and
+  // verified — proving whether our own frames are validly encrypted.
+  try {
+    const dHex = ecdh.getPrivateKey('hex');
+    fs.writeFileSync('/tmp/send_dmx-key.txt',
+      `key=${key.toString('hex')}\nd=${dHex}\nQ=${Qwire.toString('hex')}\n`);
+    log('wrote /tmp/send_dmx-key.txt');
+  } catch (e) { log('key dump failed:', e.message); }
 
-  // 6b. device sync. After 0x0F, HWM does 0x10, three 0x71 parameter reads,
-  //     then ~252 0x70 reads (it pulls the showfile/SD image). The Stick
-  //     appears to gate live DMX on a client that has performed this sync,
-  //     so replicate it: 0x71 params + a sequential 0x70 sector download.
+  // 6b. device sync — replicated to match a captured HWM session BYTE-FOR-BYTE
+  //     in both ORDER and CONTENT (verified against tools/analyze-pcap.mjs):
+  //       0x10, 0x75, 0x74, 0x71×3, 0x70 download, 0x2e
+  //     The earlier code did 0x75/0x74 AFTER the download and sent the wrong
+  //     third 0x71 param — both now corrected.
   sock.write(msg(MAGIC, 0x10, token())); await sleep(120);
-  for (const p of ['0200000000', '0100000000', '0000000000']) {
+  sock.write(msg(MAGIC, 0x75, token())); await sleep(140);
+  sock.write(msg(MAGIC, 0x74, token())); await sleep(140);
+  // HWM's 0x71 params (from the 2026-05-23 mirror capture of a working
+  // session): FOUR reads — 0200000000, 0100000000, 0100000000, 02b37f0000.
+  // The 4th was missing in the earlier code (only seen via the port mirror
+  // at the Stick) and the 3rd's value varies between HWM sessions, so it
+  // looks tolerant — but the 4th is the one opcode pattern HWM emits that
+  // we never did, so include it.
+  for (const p of ['0200000000', '0100000000', '0100000000', '02b37f0000']) {
     sock.write(msg(MAGIC, 0x71, token(), Buffer.from(p, 'hex')));
     await sleep(80);
   }
-  log('0x70 device download (256 sectors) …');
-  for (let sec = 0; sec < 256; sec++) {
+  // exact 0x70 sequence HWM session 64448 sends: sector 0, then 63..185
+  // (124 reads, flag byte = 1). The earlier 0..255 sequential read diverged.
+  const sectors = [0];
+  for (let s = 63; s <= 185; s++) sectors.push(s);
+  log(`0x70 device download (${sectors.length} sectors, HWM-exact) …`);
+  for (let i = 0; i < sectors.length; i++) {
     const body = Buffer.alloc(5);
-    body.writeUInt32LE(sec, 0);
+    body.writeUInt32LE(sectors[i], 0);
     body[4] = 1;
     sock.write(msg(MAGIC, 0x70, token(), body));
     await sleep(12);
-    if ((sec & 0x1f) === 0x1f) rxBuf = Buffer.alloc(0);   // keep rxBuf bounded
+    if ((i & 0x1f) === 0x1f) rxBuf = Buffer.alloc(0);   // keep rxBuf bounded
   }
   await sleep(200);
   rxBuf = Buffer.alloc(0);
 
-  // 7. enter live mode. In the captured HWM session the DMX stream begins
-  //    only after this 0x75/0x74/0x2e/0x10/0x11 sequence; the long 0x70
-  //    showfile download HWM does in between is editor-only and is skipped.
-  sock.write(msg(MAGIC, 0x75, token())); await sleep(140);
-  sock.write(msg(MAGIC, 0x74, token())); await sleep(140);
+  // 7. enter live mode: 0x2e, then a settle gap, then 0x10/0x11/0x10. HWM
+  //    waits ~3.7 s between 0x2e and 0x10/0x11; we use a shorter settle.
   sock.write(msg(MAGIC, 0x2e, Buffer.alloc(32))); await sleep(140);  // 0x2e: 32B payload, no token
+  await sleep(800);                                      // settle (HWM gap)
   sock.write(msg(MAGIC, 0x10, token())); await sleep(140);
   sock.write(msg(MAGIC, 0x11, token()));                 // "go live"
   const r11 = await waitFor(() => findMsg(0x11, 22), 3000);
   log(r11 ? 'live mode enabled (0x11 ok)' : '0x11 — no reply (streaming anyway)');
+  sock.write(msg(MAGIC, 0x10, token()));                 // HWM does a 0x10 after 0x11
+  const r10b = await waitFor(() => findMsg(0x10, 22), 1500);
+  if (r10b) log(`0x10 after 0x11 — crypto state ${r10b.readUInt32LE(0x12)} (HWM sees 4)`);
   return key;
+}
+
+// HWM emits four 14-byte UDP/2430 broadcasts at startup (LSAG_ALL,
+// Stick_U1, Stick_3A, Siudi_7B), three times in a row, BEFORE any TCP. Each
+// body = magic(8) + 0x0000 + 0x14000000.
+const DISCOVERY_MAGICS = ['LSAG_ALL', 'Stick_U1', 'Stick_3A', 'Siudi_7B'];
+const DISCOVERY_TAIL = Buffer.from('000014000000', 'hex');
+async function discoveryBroadcast(udp) {
+  for (let burst = 0; burst < 3; burst++) {
+    for (const m of DISCOVERY_MAGICS) {
+      const pkt = Buffer.concat([Buffer.from(m, 'ascii'), DISCOVERY_TAIL]);
+      await new Promise((r) => udp.send(pkt, 2430, '255.255.255.255', () => r()));
+    }
+    await sleep(25);
+  }
+}
+
+// HWM also broadcasts a SEPARATE "I am Hardware Manager" announcement on
+// UDP/24299 (src+dst 24299) with magic "LIGHTINGSOFT_XHL". A 114-byte
+// announce carrying the literal string "Hardware Manager", followed by
+// 46-byte status follow-ups. The 8-byte instance ID is fresh per launch.
+// We have no Stick-side traffic acknowledging these but HWM does them
+// consistently, so they may be what the Stick uses to identify a client as
+// the live controller.
+const XHL_HEADER = Buffer.from(
+  '4c49474854494e47534f46545f58484c' +  // "LIGHTINGSOFT_XHL"
+  '0000000000000000' +                   // 8B zero padding
+  '14000000' +                           // op/len = 20
+  '01000000',                            // version = 1
+  'hex');                                // 32B total
+async function announceHardwareManager(udp24299, instanceId) {
+  // 114B "I am Hardware Manager" announce
+  const body114 = Buffer.alloc(114 - 32);
+  instanceId.copy(body114, 0);                          // [32:40] instance
+  body114.writeUInt32LE(crypto.randomBytes(4).readUInt32LE(0), 8);  // [40:44] varying
+  body114.writeUInt32LE(11, 12);                        // [44:48] = 0x0b
+  body114.write('Hardware Manager\0', 18, 'ascii');     // [50:67] string
+  const pkt114 = Buffer.concat([XHL_HEADER, body114]);
+  await new Promise((r) => udp24299.send(pkt114, 24299, '255.255.255.255', () => r()));
+  await sleep(25);
+  // 2 × 46B follow-ups
+  for (let i = 0; i < 2; i++) {
+    const tail = Buffer.concat([crypto.randomBytes(4), Buffer.from([0x0a + i * 2, 0])]);
+    const pkt46 = Buffer.concat([XHL_HEADER, instanceId, tail]);
+    await new Promise((r) => udp24299.send(pkt46, 24299, '255.255.255.255', () => r()));
+    await sleep(25);
+  }
 }
 
 async function main() {
   console.log(`send_dmx → ${ip}`);
+  // 0. UDP socket up FIRST — for discovery + the live DMX stream
+  const udp = dgram.createSocket('udp4');
+  await new Promise((res, rej) => {
+    udp.once('error', rej);
+    udp.bind(UDP_SRC_PORT, () => { udp.setBroadcast(true); res(); });
+  });
+  log(`UDP socket bound to ${UDP_SRC_PORT}, broadcast enabled`);
+  await discoveryBroadcast(udp);
+  log('discovery broadcasts sent (LSAG_ALL/Stick_U1/Stick_3A/Siudi_7B × 3)');
+
+  // open a 2nd UDP socket bound to port 24299 for the LIGHTINGSOFT_XHL announce
+  const udp24299 = dgram.createSocket('udp4');
+  await new Promise((res, rej) => {
+    udp24299.once('error', rej);
+    udp24299.bind(24299, () => { udp24299.setBroadcast(true); res(); });
+  });
+  const instanceId = crypto.randomBytes(8);
+  await announceHardwareManager(udp24299, instanceId);
+  log(`LIGHTINGSOFT_XHL "Hardware Manager" announce sent (instance ${instanceId.toString('hex')})`);
+  udp24299.close();                                     // done with it — prevents process hang
+  await sleep(200);
+
   const sock = net.createConnection({ host: ip, port: TCP_PORT });
   sock.on('error', (e) => { console.error('TCP error:', e.message); process.exit(1); });
   sock.setTimeout(5000);
@@ -242,40 +334,46 @@ async function main() {
 
   const key = await handshake(sock);
 
-  // UDP DMX sender
-  const udp = dgram.createSocket('udp4');
-  await new Promise((res, rej) => { udp.once('error', rej); udp.bind(UDP_SRC_PORT, res); });
-
+  // (UDP socket already opened at the top of main() for discovery; reused here)
   for (const [u, chans] of universes) {
     const lit = [...chans.entries()].filter(([, v]) => v).map(([i, v]) => `ch${i + 1}=${v}`);
     log(`universe ${u}: ${lit.join(' ') || '(all 0)'}`);
   }
-  // stream the frame(s) at ~28 Hz while keeping the live session alive with a
-  // TCP 0x1a heartbeat every ~1s (HWM does this the whole time it streams —
-  // without it the Stick stops honouring the UDP stream). 0x10 once first.
+  // stream with INDEPENDENT steady timers, mirroring HWM's architecture: HWM
+  // runs the UDP DMX stream on its own rock-steady 25 Hz timer thread, with
+  // the TCP heartbeat on a separate thread. The earlier single-loop coupled
+  // them — it hitched the UDP stream for the heartbeat round-trip every
+  // second and ran at ~27 Hz. A live-stream detector on the Stick may want a
+  // genuine steady 25 Hz; this removes that as a variable.
   sock.write(msg(MAGIC, 0x10, token()));
-  const STREAM_MS = Number(process.env.STREAM_MS || 6000);
-  const deadline = Date.now() + STREAM_MS;
-  let nFrames = 0, beats = 0, lastBeat = Date.now();
-  while (Date.now() < deadline) {
+  const STREAM_MS = Number(process.env.STREAM_MS || 20000);
+  let nFrames = 0, beats = 0;
+
+  const udpTimer = setInterval(() => {                 // 25 Hz, exactly like HWM
     for (const [u, chans] of universes) {
-      const frame = buildFrame(key, chans, u);
-      await new Promise((res) => udp.send(frame, UDP_DST_PORT, ip, () => res()));
+      udp.send(buildFrame(key, chans, u), UDP_DST_PORT, ip, () => {});
       nFrames++;
     }
-    if (Date.now() - lastBeat >= 1000) {
-      rxBuf = Buffer.alloc(0);
-      sock.write(msg(MAGIC, 0x1a, token(), Buffer.alloc(4)));   // streaming heartbeat
-      const hb = await waitFor(() => findMsg(0x1a, 44), 800);
-      // the 0x1a reply carries the Stick's DMX frame counter at +0x24 — if it
-      // climbs while we stream, the Stick is receiving our UDP frames.
-      if (hb) log(`heartbeat ${beats}: Stick DMX frame counter = ${hb.readUInt32LE(0x24)}`);
-      else log(`heartbeat ${beats}: no reply`);
-      lastBeat = Date.now();
-      beats++;
-    }
-    await sleep(35);
-  }
+  }, 40);
+
+  const hbTimer = setInterval(() => {                  // 1 Hz TCP keepalive
+    rxBuf = Buffer.alloc(0);
+    sock.write(msg(MAGIC, 0x1a, token(), Buffer.alloc(2)));   // 20-byte heartbeat
+    waitFor(() => findMsg(0x1a, 44), 800).then((hb) => {
+      // the 0x1a reply's last 4 bytes [+0x28] are a flag: HWM sees 1 once it
+      // is the live DMX source; we have only ever seen 0. That flag is the goal.
+      if (hb) log(`heartbeat ${beats++}: liveFlag[+0x28]=${hb.readUInt32LE(40)} ` +
+                  `counter[+0x26]=${hb.readUInt32LE(38)}`);
+      else log(`heartbeat ${beats++}: no reply`);
+    });
+  }, 1000);
+
+  const p12Timer = setInterval(() => {                 // HWM's ~0.1 Hz 0x12 poll
+    sock.write(msg(MAGIC, 0x12, token()));
+  }, 10000);
+
+  await sleep(STREAM_MS);
+  clearInterval(udpTimer); clearInterval(hbTimer); clearInterval(p12Timer);
   log(`streamed ${nFrames} frames + ${beats} heartbeats over ${STREAM_MS}ms`);
 
   udp.close();
